@@ -4,7 +4,6 @@
     --success-color: #388E3C;
     --border-color: #ddd;
     --hover-bg: #f5f5f5;
-    --unavailable-movie-opacity: 0.4;
 }
 
 .form-group {
@@ -42,15 +41,39 @@ select {
     background: #45a049;
 }
 
+.btn-primary:disabled {
+    opacity: 0.6;
+    cursor: default;
+}
+
 .status-message {
     margin-top: 1rem;
     padding: 0.5rem;
     border-radius: 4px;
 }
 
+.status-message:empty {
+    display: none;
+}
+
 .success {
     background: #dff0d8;
     color: var(--success-color);
+}
+
+.error {
+    background: #f8d7da;
+    color: var(--error-color);
+}
+
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.options-container input[type="range"] {
+    width: 100%;
 }
 
 .error-message {
@@ -79,16 +102,6 @@ select {
 
 .provider-options label:hover {
     background: var(--hover-bg);
-}
-
-.unavailable-movie {
-    opacity: var(--unavailable-movie-opacity);
-    transition: opacity 0.3s ease;
-    position: relative;
-}
-
-.unavailable-movie img {
-    filter: grayscale(75%);
 }
 
 /* Loading spinner for country select */

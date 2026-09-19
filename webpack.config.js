@@ -1,7 +1,7 @@
 const path = require('path');
 const CopyPlugin = require('copy-webpack-plugin');
 
-module.exports = {
+module.exports = (env, argv) => ({
     mode: 'production',
     entry: {
         'content-script': './src/content-script.ts',
@@ -11,6 +11,7 @@ module.exports = {
     output: {
         filename: '[name].js',
         path: path.resolve(__dirname, 'dist'),
+        clean: true,
     },
     resolve: {
         extensions: ['.ts', '.js'],
@@ -32,5 +33,6 @@ module.exports = {
             ],
         }),
     ],
-    devtool: 'inline-source-map'
-};
+    // Source maps only for development builds; they triple the size of the packaged extension
+    devtool: argv.mode === 'development' ? 'inline-source-map' : false
+});

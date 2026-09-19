@@ -1,37 +1,42 @@
-import { DEFAULT_COUNTRY } from './constants';
+import { DEFAULT_COUNTRY, DEFAULT_OPACITY, DEFAULT_PROVIDERS } from './constants';
 import { ExtensionSettings, TMDBRegion } from './types';
 import { logger } from './utils/logger';
+
+function input(id: string): HTMLInputElement {
+    return document.getElementById(id) as HTMLInputElement;
+}
 
 async function saveOptions() {
     const saveBtn = document.getElementById('save') as HTMLButtonElement;
     logger.info(`[Options] Saving options...`);
     saveBtn.disabled = true;
-    const apiKey = (document.getElementById('apiKey') as HTMLInputElement).value.trim();
-    const readApiKey = (document.getElementById('readApiKey') as HTMLInputElement).value.trim();
+    const apiKey = input('apiKey').value.trim();
+    const readApiKey = input('readApiKey').value.trim();
     const providerCheckboxes = document.querySelectorAll<HTMLInputElement>(
         'input[name="provider"]:checked'
     );
-    const countryCode = (document.getElementById('country') as HTMLSelectElement).value;
-    const opacity = parseFloat((document.getElementById('opacity') as HTMLInputElement).value);
-    const fadeToggle = (document.getElementById('fadeToggle') as HTMLInputElement).checked;
-    const trueRatingsStats = (document.getElementById('trueRatingsStats') as HTMLInputElement)?.checked;
+    const countrySelect = document.getElementById('country') as HTMLSelectElement;
 
-    const settings: ExtensionSettings = {
+    const settings: Partial<ExtensionSettings> = {
         tmdbApiKey: apiKey,
         tmdbReadApiKey: readApiKey,
         selectedProviders: Array.from(providerCheckboxes).map(cb => cb.value),
-        countryCode: countryCode,
-        unavailableOpacity: opacity,
-        fadeUnavailable: fadeToggle,
-        trueRatingsStats
+        unavailableOpacity: parseFloat(input('opacity').value),
+        fadeUnavailable: input('fadeToggle').checked,
+        trueRatingsStats: input('trueRatingsStats').checked
     };
+    // Don't overwrite the saved country while the list couldn't be loaded
+    if (!countrySelect.disabled && countrySelect.value) {
+        settings.countryCode = countrySelect.value;
+    }
 
     try {
+        const previous = await browser.storage.local.get(['tmdbApiKey', 'tmdbReadApiKey']);
         await browser.storage.local.set(settings);
         showStatus('Settings saved successfully!', 'success');
 
-        // Re-enable country selection and load countries if API key is set
-        if (apiKey && readApiKey) {
+        // Reload countries when the keys changed
+        if (previous.tmdbApiKey !== apiKey || previous.tmdbReadApiKey !== readApiKey) {
             await loadCountries();
         }
     } catch (error) {
@@ -47,113 +52,86 @@ async function loadOptions() {
         const result = await browser.storage.local.get([
             'tmdbApiKey', 'tmdbReadApiKey', 'selectedProviders', 'unavailableOpacity', 'fadeUnavailable',
             'trueRatingsStats'
-        ]);
+        ]) as Partial<ExtensionSettings>;
 
-        if (result.tmdbApiKey) {
-            (document.getElementById('apiKey') as HTMLInputElement).value = result.tmdbApiKey;
-        }
-        if (result.tmdbReadApiKey) {
-            (document.getElementById('readApiKey') as HTMLInputElement).value = result.tmdbReadApiKey;
-        }
+        input('apiKey').value = result.tmdbApiKey || '';
+        input('readApiKey').value = result.tmdbReadApiKey || '';
 
-        if (result.selectedProviders) {
-            const checkboxes = document.querySelectorAll<HTMLInputElement>('input[name="provider"]');
-            checkboxes.forEach(checkbox => {
-                checkbox.checked = result.selectedProviders.includes(checkbox.value);
-            });
-        }
-        if (typeof result.unavailableOpacity === 'number') {
-            const opacityInput = document.getElementById('opacity') as HTMLInputElement;
-            opacityInput.disabled = result.fadeUnavailable === false;
-            opacityInput.value = result.unavailableOpacity.toString();
-            (document.getElementById('opacity-value') as HTMLElement).textContent = result.unavailableOpacity.toString();
-            setUnavailableOpacityCSS(result.fadeUnavailable === false ? 1 : result.unavailableOpacity);
-        } else {
-            setUnavailableOpacityCSS(result.fadeUnavailable === false ? 1 : 0.4);
-        }
+        const selected = result.selectedProviders || DEFAULT_PROVIDERS;
+        document.querySelectorAll<HTMLInputElement>('input[name="provider"]').forEach(checkbox => {
+            checkbox.checked = selected.includes(checkbox.value);
+        });
 
-        if (typeof result.fadeUnavailable === 'boolean') {
-            (document.getElementById('fadeToggle') as HTMLInputElement).checked = result.fadeUnavailable;
-        } else {
-            (document.getElementById('fadeToggle') as HTMLInputElement).checked = true;
-        }
-
-        if (typeof result.trueRatingsStats === 'boolean') {
-            (document.getElementById('trueRatingsStats') as HTMLInputElement).checked = result.trueRatingsStats;
-        } else {
-            (document.getElementById('trueRatingsStats') as HTMLInputElement).checked = false;
-        }
+        const opacity = typeof result.unavailableOpacity === 'number' ? result.unavailableOpacity : DEFAULT_OPACITY;
+        const fade = result.fadeUnavailable !== false;
+        input('opacity').value = opacity.toString();
+        input('opacity').disabled = !fade;
+        (document.getElementById('opacity-value') as HTMLElement).textContent = opacity.toString();
+        input('fadeToggle').checked = fade;
+        input('trueRatingsStats').checked = result.trueRatingsStats === true;
     } catch (error) {
         logger.error(`[Options] Error loading settings: ${error}`);
     }
 }
 
-// Set the CSS variable for opacity
-function setUnavailableOpacityCSS(value: number) {
-    document.documentElement.style.setProperty('--unavailable-movie-opacity', value.toString());
+function setCountryPlaceholder(select: HTMLSelectElement, text: string) {
+    select.replaceChildren(new Option(text, ''));
+    select.disabled = true;
 }
 
 async function loadCountries() {
     const select = document.getElementById('country') as HTMLSelectElement;
     const countryError = document.getElementById('country-error')!;
-    select.disabled = true;
-    select.innerHTML = `<option value="">Loading countries...</option>`;
+    setCountryPlaceholder(select, 'Loading countries...');
+    countryError.textContent = '';
     try {
         const { tmdbApiKey, tmdbReadApiKey } = await browser.storage.local.get(['tmdbApiKey', 'tmdbReadApiKey']);
-        if (!tmdbApiKey || !tmdbReadApiKey) {
-            select.disabled = true;
-            countryError.textContent = 'Set both TMDB API keys to enable country selection.';
+        if (!tmdbApiKey && !tmdbReadApiKey) {
+            setCountryPlaceholder(select, 'Set a TMDB API key first');
+            countryError.textContent = 'Save a TMDB API key or read token to enable country selection.';
             return;
         }
 
         const response = await browser.runtime.sendMessage({ action: 'getCountries' });
-        if (response.error) throw new Error(response.error);
-        logger.debug(`[Options] Countries loaded: ${JSON.stringify(response)}`);
+        if (!Array.isArray(response)) throw new Error(response?.error || 'Failed to load countries');
+        if (!response.length) throw new Error('TMDB returned no countries');
+        logger.debug(`[Options] ${response.length} countries loaded`);
 
-        select.innerHTML = response.map((c: TMDBRegion) =>
-            `<option value="${c.iso_3166_1}">${c.english_name}</option>`
-        ).join('');
-
+        select.replaceChildren(...response.map((c: TMDBRegion) => new Option(c.english_name, c.iso_3166_1)));
         const saved = await browser.storage.local.get('countryCode');
-        if (saved.countryCode) select.value = saved.countryCode;
-        if (!saved.countryCode) select.value = DEFAULT_COUNTRY;
+        select.value = saved.countryCode || DEFAULT_COUNTRY;
         select.disabled = false;
-        countryError.textContent = '';
     } catch (error: any) {
         logger.error(`[Options] Country load failed: ${error}`);
+        setCountryPlaceholder(select, 'Countries unavailable');
         countryError.textContent = error.message;
     }
 }
 
+let statusTimer: number | undefined;
+
 function showStatus(message: string, type: 'success' | 'error') {
     const status = document.getElementById('status')!;
     status.textContent = message;
-    status.className = type;
-    setTimeout(() => status.textContent = '', 3000);
+    status.className = `status-message ${type}`;
+    clearTimeout(statusTimer);
+    statusTimer = window.setTimeout(() => status.textContent = '', 3000);
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+    const opacityInput = input('opacity');
+    const opacityValue = document.getElementById('opacity-value') as HTMLElement;
+    opacityInput.addEventListener('input', () => {
+        opacityValue.textContent = opacityInput.value;
+    });
+
+    const fadeToggle = input('fadeToggle');
+    fadeToggle.addEventListener('change', () => {
+        opacityInput.disabled = !fadeToggle.checked;
+    });
+
+    document.getElementById('save')?.addEventListener('click', saveOptions);
+
     await loadOptions();
     await loadCountries();
-
-    // Opacity slider event
-    const opacityInput = document.getElementById('opacity') as HTMLInputElement;
-    const opacityValue = document.getElementById('opacity-value') as HTMLElement;
-    if (opacityInput && opacityValue) {
-        opacityInput.addEventListener('input', () => {
-            opacityValue.textContent = opacityInput.value;
-            setUnavailableOpacityCSS(parseFloat(opacityInput.value));
-        });
-    }
-
-    // Fade toggle event
-    const fadeToggle = document.getElementById('fadeToggle') as HTMLInputElement;
-    if (fadeToggle) {
-        fadeToggle.addEventListener('change', () => {
-            opacityInput.disabled = !fadeToggle.checked;
-            setUnavailableOpacityCSS(fadeToggle.checked ? parseFloat(opacityInput.value) : 1);
-        });
-    }
 });
-document.getElementById('save')?.addEventListener('click', saveOptions);
-

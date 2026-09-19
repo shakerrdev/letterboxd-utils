@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <title>Extension Settings</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="options.css">
 </head>
 
 <body>
@@ -15,11 +15,11 @@
       <input type="password" id="apiKey" placeholder="Enter your TMDB API key">
     </div>
     <div class="form-group">
-      <label for="readApiKey">TMDB Read Token:</label>
-      <input type="password" id="readApiKey" placeholder="Enter your TMDB Read Token">
+      <label for="readApiKey">TMDB Read Access Token:</label>
+      <input type="password" id="readApiKey" placeholder="Enter your TMDB Read Access Token">
     </div>
     <div class="help-text">
-      Get your API keys from <a href="https://www.themoviedb.org/settings/api" target="_blank">TMDB</a>
+      Only one of the two is needed. Get them from <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">TMDB</a>.
     </div>
     <div class="form-group">
       <label>Streaming Providers:</label>
@@ -42,7 +42,7 @@
       <div id="country-error" class="error-message"></div>
     </div>
     <div class="form-group">
-      <label>
+      <label class="checkbox-label">
         <input type="checkbox" id="fadeToggle">
         Enable fading for unavailable movies
       </label>
@@ -50,10 +50,10 @@
     <div class="form-group">
       <label for="opacity">Unavailable Movie Opacity: <span id="opacity-value">0.4</span></label>
       <input type="range" id="opacity" min="0.1" max="0.9" step="0.01" value="0.4">
-      <div class="help-text">Adjust how faded unavailable movies appear (0.05 = most faded, 1 = fully visible).</div>
+      <div class="help-text">Adjust how faded unavailable movies appear (0.1 = most faded, 0.9 = barely faded).</div>
     </div>
     <div class="form-group">
-      <label>
+      <label class="checkbox-label">
         <input type="checkbox" id="trueRatingsStats">
         Show true average, median, mode, and standard deviation for ratings on movie pages
       </label>
@@ -61,7 +61,7 @@
     <button id="save" class="btn-primary">Save Settings</button>
     <div id="status" class="status-message"></div>
   </div>
-  <script src="./options.js" type="module"></script>
+  <script src="./options.js"></script>
 </body>
 
 </html>

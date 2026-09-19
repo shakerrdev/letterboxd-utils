@@ -8,7 +8,7 @@ export interface ExtensionSettings {
     countryCode?: string;
     unavailableOpacity?: number;
     fadeUnavailable?: boolean;
-    trueRatingsStats?: boolean; // add this line
+    trueRatingsStats?: boolean;
 }
 
 /**
@@ -23,6 +23,7 @@ export interface TMDBRegion {
 export interface TMDBMovieSearchResult {
     id: number;
     title: string;
+    original_title?: string;
     release_date?: string;
     popularity: number;
 }
