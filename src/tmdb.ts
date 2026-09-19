@@ -1,28 +1,50 @@
 import { TMDBRegion, TMDBMovieSearchResult, TMDBSearchResponse, TMDBWatchProviderResponse } from './types';
 import { logger } from './utils/logger';
 
+export class TMDBError extends Error {
+    constructor(message: string, public status: number) {
+        super(message);
+        this.name = 'TMDBError';
+    }
+}
+
+function normalizeTitle(title: string): string {
+    return title.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+}
+
 export class TMDBClient {
     private readonly baseUrl = 'https://api.themoviedb.org/3';
-    private readonly headers: HeadersInit;
+    private readonly headers: Record<string, string>;
     private lastCallTime = 0;
-    private readonly readApiKey: string;
 
     // Adaptive rate limiting
     private minRPS = 1;
     private maxRPS = 30;
     private rps = 10;
 
-    constructor(private apiKey: string, readApiKey?: string) {
-        this.headers = {
-            'Authorization': `Bearer ${readApiKey}`,
-            'accept': 'application/json'
-        };
-        this.readApiKey = readApiKey || '';
+    /**
+     * Either credential works for the v3 endpoints used here: the read access
+     * token is sent as a Bearer header, the API key as a query parameter.
+     */
+    constructor(private apiKey?: string, private readApiKey?: string) {
+        this.headers = { 'accept': 'application/json' };
+        if (readApiKey) this.headers['Authorization'] = `Bearer ${readApiKey}`;
     }
 
-    private async adaptiveFetch(input: RequestInfo, init?: RequestInit): Promise<Response> {
+    get hasCredentials(): boolean {
+        return !!(this.apiKey || this.readApiKey);
+    }
+
+    private buildUrl(path: string, params: Record<string, string> = {}): string {
+        const url = new URL(`${this.baseUrl}${path}`);
+        for (const [key, value] of Object.entries(params)) url.searchParams.set(key, value);
+        if (!this.readApiKey && this.apiKey) url.searchParams.set('api_key', this.apiKey);
+        return url.toString();
+    }
+
+    private async adaptiveFetch(url: string): Promise<Response> {
         await this.rateLimit();
-        const response = await fetch(input, init);
+        const response = await fetch(url, { headers: this.headers });
         if (response.status === 429) {
             this.rps = Math.max(this.rps - 2, this.minRPS);
             logger.warn(`[TMDBClient] 429 received, reducing RPS to ${this.rps}`);
@@ -32,57 +54,48 @@ export class TMDBClient {
                 logger.debug(`[TMDBClient] Success, increasing RPS to ${this.rps}`);
             }
         }
+        if (!response.ok) {
+            throw new TMDBError(`TMDB request failed: ${response.status}`, response.status);
+        }
         return response;
     }
 
     async searchMovie(title: string, year?: number): Promise<TMDBMovieSearchResult | null> {
-        // await this.rateLimit();
+        const params: Record<string, string> = {
+            query: title,
+            include_adult: 'false',
+            language: 'en-US',
+            page: '1',
+        };
+        if (year) params.year = year.toString();
 
-        const url = new URL(`${this.baseUrl}/search/movie`);
-        url.searchParams.set('query', title);
-        url.searchParams.set('include_adult', 'false');
-        url.searchParams.set('language', 'en-US');
-        url.searchParams.set('page', '1');
-        if (year) url.searchParams.set('year', year.toString());
-
-        const response = await this.adaptiveFetch(url.toString(), { headers: this.headers });
-
-        if (!response.ok) {
-            throw new Error(`TMDB search failed: ${response.status}`);
-        }
-
+        const response = await this.adaptiveFetch(this.buildUrl('/search/movie', params));
         const data: TMDBSearchResponse = await response.json();
-        if (data.total_results === 0) {
+        if (!data.results?.length) {
             logger.warn(`[searchMovie] No results found for "${title}"${year ? ` (${year})` : ''}`);
             return null;
         }
-        return data.results.sort((a, b) => b.popularity - a.popularity)[0] || null;
+
+        // Prefer exact title matches, then the most popular result
+        const wanted = normalizeTitle(title);
+        const isExact = (m: TMDBMovieSearchResult) =>
+            normalizeTitle(m.title) === wanted || normalizeTitle(m.original_title || '') === wanted;
+        return [...data.results].sort((a, b) =>
+            Number(isExact(b)) - Number(isExact(a)) || b.popularity - a.popularity
+        )[0];
     }
 
     async getAvailableCountries(): Promise<TMDBRegion[]> {
-        // Use the read API key (v3) for this endpoint
-        const response = await this.adaptiveFetch(
-            `${this.baseUrl}/watch/providers/regions?api_key=${this.apiKey}`
-        );
-        return (await response.json()).results;
+        const response = await this.adaptiveFetch(this.buildUrl('/watch/providers/regions'));
+        const regions: TMDBRegion[] = (await response.json()).results || [];
+        return regions.sort((a, b) => a.english_name.localeCompare(b.english_name));
     }
 
     async getStreamingProviders(movieId: number, countryCode: string): Promise<string[]> {
-        // await this.rateLimit();
-
-        const response = await this.adaptiveFetch(
-            `${this.baseUrl}/movie/${movieId}/watch/providers`,
-            { headers: this.headers }
-        );
-
-        if (!response.ok) {
-            throw new Error(`TMDB providers failed: ${response.status}`);
-        }
-
+        const response = await this.adaptiveFetch(this.buildUrl(`/movie/${movieId}/watch/providers`));
         const data: TMDBWatchProviderResponse = await response.json();
-        const countryData = data.results[countryCode] || {};
-
-        return countryData.flatrate?.map((p: any) => p.provider_name.toLowerCase()) || [];
+        const countryData = data.results?.[countryCode] || {};
+        return countryData.flatrate?.map(p => p.provider_name.toLowerCase()) || [];
     }
 
     private async rateLimit(): Promise<void> {

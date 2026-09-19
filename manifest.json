@@ -2,15 +2,14 @@
     "manifest_version": 2,
     "name": "Letterboxd utils",
     "version": "1.4.0",
-    "description": "Utilities for letterboxd.com. For now just filtering movies based on streaming providers.",
+    "description": "Utilities for letterboxd.com: fade movies not on your streaming services and show detailed rating stats.",
     "icons": {
         "383": "icon.png"
     },
     "permissions": [
         "https://letterboxd.com/*",
         "https://api.themoviedb.org/3/*",
-        "storage",
-        "webRequest"
+        "storage"
     ],
     "background": {
         "scripts": [
@@ -34,7 +33,7 @@
                 "content-script.js"
             ],
             "css": [
-                "styles.css"
+                "content.css"
             ]
         }
     ],

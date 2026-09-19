@@ -1,0 +1,44 @@
+:root {
+    --unavailable-movie-opacity: 0.4;
+}
+
+.unavailable-movie {
+    opacity: var(--unavailable-movie-opacity);
+    transition: opacity 0.3s ease;
+    position: relative;
+}
+
+.unavailable-movie img {
+    filter: grayscale(75%);
+}
+
+.letterboxd-utils-warning {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    padding: 15px;
+    background: #ff4444;
+    color: white;
+    border-radius: 5px;
+    z-index: 9999;
+    cursor: pointer;
+}
+
+.fade-toggle-navitem .navlink {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.fade-toggle-navitem .label {
+    font-size: 13px;
+}
+
+.true-ratings-stats-section {
+    margin-top: 10px;
+}
+
+.true-ratings-stats {
+    font-size: 13px;
+    color: #9ab;
+}

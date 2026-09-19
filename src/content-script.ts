@@ -1,9 +1,14 @@
-import { DEFAULT_COUNTRY, DEFAULT_PROVIDERS } from './constants';
-import { TMDBClient } from './tmdb'
+import { DEFAULT_COUNTRY, DEFAULT_OPACITY, DEFAULT_PROVIDERS } from './constants';
+import { hasAnyProvider } from './providers';
+import { calcStats, parseBarCount } from './ratings-stats';
+import { TMDBClient, TMDBError } from './tmdb'
 import { ExtensionSettings } from './types'
 import { logger } from './utils/logger';
 
 const CACHE_LIFETIME_MS = 12 * 60 * 60 * 1000; // 12 hours
+// Expired entries are still shown while re-fetching; drop them after this
+const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const CACHE_PERSIST_DELAY_MS = 2000;
 
 type MovieCacheEntry = {
     tmdbId?: number;
@@ -20,109 +25,148 @@ type MovieElementInfo = {
     cacheKey: string;
 };
 
+const SETTINGS_KEYS = [
+    'tmdbApiKey', 'tmdbReadApiKey', 'selectedProviders', 'countryCode',
+    'unavailableOpacity', 'fadeUnavailable', 'trueRatingsStats'
+];
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 class StreamFilter {
     private tmdb: TMDBClient;
-    private targetProviders: Set<string>;
-    private memoryCache = new Map<string, MovieCacheEntry>();
+    private targetProviders: string[] = [];
+    private countryCode = DEFAULT_COUNTRY;
+    private memoryCache: MovieCache = {};
+    private cacheLoaded: Promise<void>;
+    private dirtyKeys = new Set<string>();
+    private persistTimer: number | null = null;
     private processedElements = new WeakSet<HTMLElement>();
     private debounceTimer: number | null = null;
+    private authFailed = false;
+    private observer: MutationObserver | null = null;
+    private stopped = false;
 
-    constructor(apiKey: string, providers: string[], private countryCode: string, readApiKey?: string) {
-        logger.info(`[StreamFilter] Initializing with providers: ${providers}`);
+    constructor(apiKey: string | undefined, readApiKey: string | undefined, providers: string[], countryCode: string) {
         this.tmdb = new TMDBClient(apiKey, readApiKey);
-        this.targetProviders = new Set(providers.map(p => p.toLowerCase()));
+        this.setFilter(providers, countryCode);
+        this.cacheLoaded = browser.storage.local.get('movieCache')
+            .then(res => { this.memoryCache = res.movieCache || {}; })
+            .catch(error => logger.error(`[StreamFilter] Failed to load cache: ${error}`));
+    }
+
+    private setFilter(providers: string[], countryCode: string): void {
+        logger.info(`[StreamFilter] Filtering for providers: ${providers} in ${countryCode}`);
+        this.targetProviders = providers.map(p => p.toLowerCase());
+        this.countryCode = countryCode;
+    }
+
+    /** Re-applies the filter to every poster, e.g. after settings changed. */
+    public async updateFilter(providers: string[], countryCode: string): Promise<void> {
+        this.setFilter(providers, countryCode);
+        this.processedElements = new WeakSet();
+        await this.processAllMovies(this.findPosters());
     }
 
     private async withRetry<T>(fn: () => Promise<T>, retries = 2): Promise<T> {
         try {
             return await fn();
-        } catch (error: any) {
-            logger.error(`[withRetry] Error: ${error}`);
-            // If 429, let TMDBClient handle RPS reduction
-            if (retries <= 0) throw error;
-            // No local rate limit, just retry
+        } catch (error) {
+            const status = error instanceof TMDBError ? error.status : 0;
+            // Client errors other than rate limiting won't succeed on retry
+            if (retries <= 0 || (status >= 400 && status < 500 && status !== 429)) throw error;
+            logger.warn(`[withRetry] ${error}, retrying...`);
+            await sleep(status === 429 ? 2000 : 500);
             return this.withRetry(fn, retries - 1);
         }
     }
 
     private normalizeTitle(title: string): string {
-        // Remove extra whitespace, lowercase, remove punctuation
         return title
+            .toLowerCase()
+            .replace(/[^\p{L}\p{N}\s]/gu, '')
             .replace(/\s+/g, ' ')
-            .replace(/[^\w\s]/gi, '')
-            .trim()
-            .toLowerCase();
+            .trim();
     }
 
     private getCacheKey(title: string, year: string): string {
-        // Use normalized title and year for cache key
-        return `${this.normalizeTitle(title || '')}-${year || ''}`;
+        // Providers differ per country, so the country is part of the key
+        return `${this.countryCode}:${this.normalizeTitle(title)}-${year}`;
     }
 
-    private async getMovieCacheEntry(key: string): Promise<MovieCacheEntry | null> {
-        // Try memory cache first
-        const mem = this.memoryCache.get(key);
-        if (mem) return mem;
-
-        // Load all cache from storage
-        const cacheObj = await browser.storage.local.get('movieCache');
-        const allCache: MovieCache = cacheObj.movieCache || {};
-        const entry = allCache[key];
-        if (entry) {
-            this.memoryCache.set(key, entry);
-            return entry;
+    private setMovieCache(key: string, entry: MovieCacheEntry): void {
+        this.memoryCache[key] = entry;
+        this.dirtyKeys.add(key);
+        if (this.persistTimer === null) {
+            this.persistTimer = window.setTimeout(() => this.persistCache(), CACHE_PERSIST_DELAY_MS);
         }
-        return null;
     }
 
-    private async setMovieCache(key: string, entry: MovieCacheEntry): Promise<void> {
-        this.memoryCache.set(key, entry);
-        // Update the cache object in storage
-        const cacheObj = await browser.storage.local.get('movieCache');
-        const allCache: MovieCache = cacheObj.movieCache || {};
-        allCache[key] = entry;
-        await browser.storage.local.set({ movieCache: allCache });
+    /** Writes changed entries, merging with what other tabs may have stored. */
+    private async persistCache(): Promise<void> {
+        this.persistTimer = null;
+        const keys = Array.from(this.dirtyKeys);
+        this.dirtyKeys.clear();
+        try {
+            const res = await browser.storage.local.get('movieCache');
+            const stored: MovieCache = res.movieCache || {};
+            for (const key of keys) stored[key] = this.memoryCache[key];
+
+            const now = Date.now();
+            for (const key of Object.keys(stored)) {
+                if (!stored[key] || now - stored[key].timestamp > CACHE_MAX_AGE_MS) delete stored[key];
+            }
+            await browser.storage.local.set({ movieCache: stored });
+        } catch (error) {
+            logger.error(`[StreamFilter] Failed to persist cache: ${error}`);
+        }
     }
 
     private getMovieElementInfo(element: HTMLElement): MovieElementInfo | null {
-        const titleElement = element.querySelector('.frame-title');
-        if (!titleElement) {
-            logger.warn(`[getMovieElementInfo] No title element found in ${element}`);
-            return null;
-        }
-        let title = titleElement.textContent?.trim() || '';
-        const yearMatch = title.match(/\((\d{4})\)/);
+        // Posters are rendered by a React component whose wrapper carries the
+        // name as "Title (Year)"; the frame title is filled in later.
+        const wrapper = element.closest<HTMLElement>('[data-item-full-display-name], [data-item-name]');
+        let title = wrapper?.dataset.itemFullDisplayName
+            || wrapper?.dataset.itemName
+            || element.querySelector('.frame-title')?.textContent?.trim()
+            || '';
+        const yearMatch = title.match(/\((\d{4})\)\s*$/);
         const year = yearMatch ? yearMatch[1] : '';
         if (yearMatch) {
-            title = title.replace(yearMatch[0], '').trim();
+            title = title.slice(0, yearMatch.index).trim();
         }
-        const cacheKey = this.getCacheKey(title, year);
-        return { element, title, year, cacheKey };
+        if (!title) return null;
+        return { element, title, year, cacheKey: this.getCacheKey(title, year) };
     }
 
     private async processMovieWithTMDB(info: MovieElementInfo): Promise<void> {
+        if (this.authFailed || this.stopped) return;
         try {
             const movie = await this.withRetry(() =>
                 this.tmdb.searchMovie(info.title, info.year ? parseInt(info.year) : undefined)
             );
             if (!movie) {
-                await this.setMovieCache(info.cacheKey, { timestamp: Date.now(), providers: [] });
-                this.updateElement(info.element, false);
+                this.setMovieCache(info.cacheKey, { timestamp: Date.now(), providers: [] });
+                this.updateElement(info.element, []);
                 return;
             }
             const providers = await this.withRetry(() =>
                 this.tmdb.getStreamingProviders(movie.id, this.countryCode)
             );
-            await this.setMovieCache(info.cacheKey, {
+            this.setMovieCache(info.cacheKey, {
                 tmdbId: movie.id,
                 providers,
                 timestamp: Date.now()
             });
-            const hasProvider = providers.some(p => this.targetProviders.has(p));
-            this.updateElement(info.element, hasProvider);
+            this.updateElement(info.element, providers);
         } catch (error) {
-            await this.setMovieCache(info.cacheKey, { timestamp: Date.now(), providers: [] });
-            this.updateElement(info.element, false);
+            // Leave the poster as it is: a failed lookup says nothing about availability
+            logger.error(`[StreamFilter] Lookup failed for "${info.title}": ${error}`);
+            if (error instanceof TMDBError && error.status === 401) {
+                this.authFailed = true;
+                showWarning('<strong>TMDB rejected the API key.</strong> Check it in the extension settings.');
+            }
         }
     }
 
@@ -130,259 +174,163 @@ class StreamFilter {
         return Date.now() - entry.timestamp >= CACHE_LIFETIME_MS;
     }
 
+    private findPosters(): HTMLElement[] {
+        return Array.from(document.querySelectorAll<HTMLElement>('.film-poster'));
+    }
+
     private async processAllMovies(elements: HTMLElement[]): Promise<void> {
-        // 1. Gather info for all movie elements
-        const infos: MovieElementInfo[] = [];
+        await this.cacheLoaded;
+
+        const uncached: MovieElementInfo[] = [];
+        const expired: MovieElementInfo[] = [];
         for (const el of elements) {
             if (this.processedElements.has(el)) continue;
             const info = this.getMovieElementInfo(el);
-            if (!info?.title) continue;
-            if (info) infos.push(info);
-        }
+            // No title yet: the poster is still rendering, retry on a later mutation
+            if (!info) continue;
+            // Mark now so overlapping runs don't look the same poster up twice
+            this.processedElements.add(el);
 
-        // 2. Check cache for all movies
-        const uncached: MovieElementInfo[] = [];
-        const expired: MovieElementInfo[] = [];
-        for (const info of infos) {
-            const cached = await this.getMovieCacheEntry(info.cacheKey);
-            if (cached && cached.providers) {
-                if (this.isCacheExpired(cached)) {
-                    expired.push(info);
-                }
-                const hasProvider = cached.providers.some(p => this.targetProviders.has(p));
-                if (!hasProvider) {
-                    this.updateElement(info.element, false);
-                } else {
-                    this.updateElement(info.element, true);
-                }
-                this.processedElements.add(info.element);
+            const cached = this.memoryCache[info.cacheKey];
+            if (cached?.providers) {
+                this.updateElement(el, cached.providers);
+                if (this.isCacheExpired(cached)) expired.push(info);
             } else {
                 uncached.push(info);
             }
         }
 
-        // 3. Process uncached movies (rate-limited, minimal delay)
-        for (const info of uncached) {
+        // Uncached first, then refresh expired entries (both rate-limited by the client)
+        for (const info of [...uncached, ...expired]) {
             await this.processMovieWithTMDB(info);
-            this.processedElements.add(info.element);
-        }
-
-        // 4. Process expired cache movies (rate-limited, after uncached)
-        for (const info of expired) {
-            await this.processMovieWithTMDB(info);
-            this.processedElements.add(info.element);
         }
     }
 
     public async observePage(): Promise<void> {
-        // Initial processing
-        const initialElements = Array.from(document.querySelectorAll<HTMLElement>(
-            '.film-poster'
-        ));
-        await this.processAllMovies(initialElements);
-
-        // Debounced mutation observer
-        const processMutations = async () => {
-            const newElements = Array.from(document.querySelectorAll<HTMLElement>(
-                '.film-poster'
-            )).filter(el => !this.processedElements.has(el));
-            if (newElements.length > 0) {
-                await this.processAllMovies(newElements);
-            }
-        };
-
-        const observer = new MutationObserver(() => {
+        this.observer = new MutationObserver(() => {
             if (this.debounceTimer) clearTimeout(this.debounceTimer);
             this.debounceTimer = window.setTimeout(() => {
-                processMutations();
+                const newElements = this.findPosters().filter(el => !this.processedElements.has(el));
+                if (newElements.length > 0) this.processAllMovies(newElements);
             }, 400);
         });
+        this.observer.observe(document.body, { childList: true, subtree: true });
 
-        observer.observe(document.body, {
-            childList: true,
-            subtree: true,
-            attributes: false
-        });
+        await this.processAllMovies(this.findPosters());
     }
 
-    private updateElement(element: HTMLElement, isAvailable: boolean): void {
+    public stop(): void {
+        this.stopped = true;
+        this.observer?.disconnect();
+        if (this.debounceTimer) clearTimeout(this.debounceTimer);
+    }
+
+    private updateElement(element: HTMLElement, providers: string[]): void {
+        const isAvailable = hasAnyProvider(providers, this.targetProviders);
         element.classList.toggle('unavailable-movie', !isAvailable);
     }
 }
 
-function showApiKeyWarning(): void {
-    logger.info('[showApiKeyWarning] Displaying warning to user');
-    const warningId = 'api-key-warning';
-
-    if (document.getElementById(warningId)) return;
-
-    const warning = document.createElement('div');
-    warning.id = warningId;
-    warning.style.cssText = `
-    position: fixed;
-    bottom: 20px;
-    right: 20px;
-    padding: 15px;
-    background: #ff4444;
-    color: white;
-    border-radius: 5px;
-    z-index: 9999;
-  `;
-    warning.innerHTML = '<strong>TMDB API key required!</strong> Configure it in the extension settings.';
-    document.body.appendChild(warning);
-
-    browser.storage.onChanged.addListener(async (changes) => {
-        if (changes.tmdbApiKey && changes.tmdbApiKey.newValue) {
-            const existingWarning = document.getElementById(warningId);
-            if (existingWarning) {
-                existingWarning.remove();
-                logger.info('[showApiKeyWarning] Warning removed after API key was added.');
-            }
-
-            const result = await browser.storage.local.get(['tmdbApiKey', 'tmdbReadApiKey', 'selectedProviders', 'countryCode']);
-            const settings = result as ExtensionSettings;
-            const country = settings.countryCode || DEFAULT_COUNTRY;
-            const providers = settings.selectedProviders || DEFAULT_PROVIDERS;
-            new StreamFilter(settings.tmdbApiKey, providers, country, settings.tmdbReadApiKey).observePage();
-        }
-    });
-}
-
-function setUnavailableOpacityCSS(value: number) {
-    document.documentElement.style.setProperty('--unavailable-movie-opacity', value.toString());
-}
-
-// Listen for changes to unavailableOpacity and fadeUnavailable and update CSS variable immediately
-browser.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local') {
-        let fade = true;
-        let opacity = 0.4;
-        if (changes.fadeUnavailable) {
-            fade = changes.fadeUnavailable.newValue !== false;
-        }
-        if (changes.unavailableOpacity) {
-            opacity = typeof changes.unavailableOpacity.newValue === 'number'
-                ? changes.unavailableOpacity.newValue
-                : 0.4;
-        }
-        // If fadeUnavailable is present, use it; otherwise, get current from storage
-        if ('fadeUnavailable' in changes) {
-            setUnavailableOpacityCSS(fade ? opacity : 1);
-        } else if ('unavailableOpacity' in changes) {
-            browser.storage.local.get('fadeUnavailable').then(res => {
-                setUnavailableOpacityCSS(res.fadeUnavailable === false ? 1 : opacity);
-            });
-        }
+function showWarning(html: string): void {
+    const warningId = 'letterboxd-utils-warning';
+    let warning = document.getElementById(warningId);
+    if (!warning) {
+        warning = document.createElement('div');
+        warning.id = warningId;
+        warning.className = 'letterboxd-utils-warning';
+        warning.title = 'Click to dismiss';
+        warning.addEventListener('click', () => warning?.remove());
+        document.body.appendChild(warning);
     }
-});
+    warning.innerHTML = html;
+}
 
-logger.info('[ContentScript] Initializing extension...');
-browser.storage.local.get(['tmdbApiKey', 'tmdbReadApiKey', 'selectedProviders', 'countryCode', 'unavailableOpacity', 'fadeUnavailable', 'trueRatingsStats'])
-    .then((result: { [key: string]: any }) => {
-        const settings = result as ExtensionSettings;
-        const fade = settings.fadeUnavailable !== false;
-        const opacity = typeof settings.unavailableOpacity === 'number' ? settings.unavailableOpacity : 0.4;
-        setUnavailableOpacityCSS(fade ? opacity : 1);
-        if (!settings.tmdbApiKey) {
-            showApiKeyWarning();
-            addFadeToggleToNav();
-            return;
-        }
+function hideWarning(): void {
+    document.getElementById('letterboxd-utils-warning')?.remove();
+}
 
-        const country = result.countryCode || DEFAULT_COUNTRY;
-        const providers = settings.selectedProviders || DEFAULT_PROVIDERS;
-        new StreamFilter(settings.tmdbApiKey, providers, country, settings.tmdbReadApiKey).observePage();
-        addFadeToggleToNav();
-        observeRatingsStatsFeature();
-    })
-    .catch(error => {
-        logger.error(`[ContentScript] Error loading settings: ${error}`);
-        setUnavailableOpacityCSS(0.4);
-        new StreamFilter('', DEFAULT_PROVIDERS, DEFAULT_COUNTRY).observePage();
-        addFadeToggleToNav();
-        observeRatingsStatsFeature();
+// --- FADING ---
+function getOpacity(settings: Partial<ExtensionSettings>): number {
+    if (settings.fadeUnavailable === false) return 1;
+    return typeof settings.unavailableOpacity === 'number' ? settings.unavailableOpacity : DEFAULT_OPACITY;
+}
+
+function applyFadeSettings(settings: Partial<ExtensionSettings>): void {
+    document.documentElement.style.setProperty('--unavailable-movie-opacity', getOpacity(settings).toString());
+    const fade = settings.fadeUnavailable !== false;
+    document.querySelectorAll<HTMLElement>('.fade-toggle-navitem a').forEach(btn => {
+        btn.setAttribute('aria-pressed', fade ? 'true' : 'false');
+        const label = btn.querySelector('.label');
+        if (label) label.textContent = fade ? 'Fading: ON' : 'Fading: OFF';
     });
-logger.info('[ContentScript] Script loaded successfully');
+}
 
-// --- TRUE RATINGS STATS FEATURE ---
-function parseRatingsHistogram(): number[] | null {
-    const section = document.querySelector('.section.ratings-histogram-chart');
-    if (!section) return null;
-    const bars = section.querySelectorAll('li.rating-histogram-bar a');
+// Add a toggle button to the nav bar for fading unavailable movies
+function addFadeToggleToNav(settings: Partial<ExtensionSettings>, attempts = 20): void {
+    const nav = document.querySelector('ul.navitems');
+    if (!nav) {
+        if (attempts > 0) setTimeout(() => addFadeToggleToNav(settings, attempts - 1), 500);
+        return;
+    }
+    if (nav.querySelector('.fade-toggle-navitem')) return;
+
+    const li = document.createElement('li');
+    li.className = 'navitem fade-toggle-navitem main-nav-fade';
+
+    const btn = document.createElement('a');
+    btn.href = '#';
+    btn.className = 'navlink has-icon';
+    btn.setAttribute('role', 'button');
+
+    const label = document.createElement('span');
+    label.className = 'label';
+    btn.appendChild(label);
+    li.appendChild(btn);
+
+    btn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        const res = await browser.storage.local.get('fadeUnavailable');
+        // The storage listener applies the change
+        await browser.storage.local.set({ fadeUnavailable: res.fadeUnavailable === false });
+    });
+
+    // Insert after Activity nav item
+    const activityNav = nav.querySelector('.main-nav-activity');
+    nav.insertBefore(li, activityNav ? activityNav.nextSibling : null);
+    applyFadeSettings(settings);
+}
+
+// --- TRUE RATINGS STATS ---
+const RATINGS_SECTION_SELECTOR = '.section.ratings-histogram-chart:not(.imdb-ratings):not(.tomato-ratings):not(.meta-ratings)';
+
+function parseRatingsHistogram(section: Element): number[] | null {
+    const bars = section.querySelectorAll('li.rating-histogram-bar');
     if (!bars.length) return null;
-
-    // Map of rating value to count
-    // Ratings order: 0.5, 1, 1.5, ..., 5
-    const ratingValues = [0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5];
-    const counts: number[] = [];
-
-    bars.forEach((a, i) => {
-        // Example: "1,343 half-★ ratings (0%)"
-        // or "3,808 ★ ratings (1%)"
-        const text = a.getAttribute('data-original-title') || a.textContent || '';
-        const match = text.match(/([\d,]+)[^\d]+ratings/);
-        if (match) {
-            counts[i] = parseInt(match[1].replace(/,/g, ''), 10);
-        } else {
-            counts[i] = 0;
-        }
+    return Array.from(bars).map(bar => {
+        const a = bar.querySelector('a');
+        const text = a?.getAttribute('data-original-title') || a?.getAttribute('title')
+            || bar.getAttribute('data-original-title') || bar.getAttribute('title')
+            || bar.textContent || '';
+        return parseBarCount(text);
     });
-
-    // Expand to array of all ratings
-    const ratings: number[] = [];
-    for (let i = 0; i < ratingValues.length; ++i) {
-        for (let j = 0; j < (counts[i] || 0); ++j) {
-            ratings.push(ratingValues[i]);
-        }
-    }
-    return ratings;
 }
 
-function calcStats(ratings: number[]) {
-    if (!ratings.length) return null;
-    const n = ratings.length;
-    const sorted = [...ratings].sort((a, b) => a - b);
-    const sum = ratings.reduce((a, b) => a + b, 0);
-    const mean = sum / n;
-    const median = n % 2 === 0
-        ? (sorted[n / 2 - 1] + sorted[n / 2]) / 2
-        : sorted[Math.floor(n / 2)];
-    // Mode: most frequent value(s)
-    const freq: Record<number, number> = {};
-    let maxFreq = 0;
-    let mode: number[] = [];
-    for (const r of ratings) {
-        freq[r] = (freq[r] || 0) + 1;
-        if (freq[r] > maxFreq) {
-            maxFreq = freq[r];
-        }
-    }
-    mode = Object.keys(freq)
-        .filter(k => freq[+k] === maxFreq)
-        .map(Number);
-    // Standard deviation
-    const variance = ratings.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / n;
-    const stddev = Math.sqrt(variance);
-    return { mean, median, mode, stddev, n };
+function formatRating(value: number): string {
+    return value.toFixed(2).replace(/\.?0+$/, '');
 }
 
-function injectTrueRatingsStats() {
-    // Find the main Letterboxd ratings section
-    const origSection = document.querySelector('.section.ratings-histogram-chart:not(.imdb-ratings):not(.tomato-ratings):not(.meta-ratings)');
+function injectTrueRatingsStats(): void {
+    const origSection = document.querySelector(RATINGS_SECTION_SELECTOR);
     if (!origSection) return;
+    if (origSection.nextElementSibling?.classList.contains('true-ratings-stats-section')) return;
 
-    // Avoid duplicate insertion
-    if (origSection.nextElementSibling && origSection.nextElementSibling.classList.contains('true-ratings-stats-section')) return;
-
-    const ratings = parseRatingsHistogram();
-    if (!ratings) return;
-    const stats = calcStats(ratings);
+    const counts = parseRatingsHistogram(origSection);
+    if (!counts) return;
+    const stats = calcStats(counts);
     if (!stats) return;
 
-    // Create a new section for the stats
     const statsSection = document.createElement('section');
     statsSection.className = 'section true-ratings-stats-section';
-    statsSection.style.marginTop = '10px';
 
     const heading = document.createElement('h2');
     heading.className = 'section-heading';
@@ -390,128 +338,93 @@ function injectTrueRatingsStats() {
 
     const statsDiv = document.createElement('div');
     statsDiv.className = 'true-ratings-stats';
-    statsDiv.style.fontSize = '13px';
-    statsDiv.style.color = '#666';
+    const rows: [string, string][] = [
+        ['True average', stats.mean.toFixed(2)],
+        ['Median', formatRating(stats.median)],
+        ['Mode', stats.mode.map(formatRating).join(', ')],
+        ['Standard deviation', stats.stddev.toFixed(2)],
+        ['Total ratings', stats.n.toLocaleString()],
+    ];
+    for (const [name, value] of rows) {
+        const row = document.createElement('div');
+        const strong = document.createElement('strong');
+        strong.textContent = `${name}: `;
+        row.append(strong, value);
+        statsDiv.appendChild(row);
+    }
 
-    statsDiv.innerHTML = `
-        <div>
-            <strong>True average:</strong> ${stats.mean.toFixed(2)}<br>
-            <strong>Median:</strong> ${stats.median.toFixed(2)}<br>
-            <strong>Mode:</strong> ${stats.mode.join(', ')}<br>
-            <strong>Standard deviation:</strong> ${stats.stddev.toFixed(2)}<br>
-            <strong>Total ratings:</strong> ${stats.n.toLocaleString()}
-        </div>
-    `;
-
-    statsSection.appendChild(heading);
-    statsSection.appendChild(statsDiv);
-
-    // Insert after the original ratings section
-    origSection.parentElement?.insertBefore(statsSection, origSection.nextElementSibling);
+    statsSection.append(heading, statsDiv);
+    origSection.after(statsSection);
 }
 
-// Observe for ratings section and inject stats if enabled
-function observeRatingsStatsFeature() {
-    let enabled = false;
-    browser.storage.local.get('trueRatingsStats').then(res => {
-        enabled = !!res.trueRatingsStats;
-        if (enabled) injectTrueRatingsStats();
-    });
+function observeRatingsStatsFeature(initiallyEnabled: boolean): void {
+    // Ratings histograms only exist on film pages
+    if (!location.pathname.startsWith('/film/')) return;
+    let enabled = initiallyEnabled;
+    if (enabled) injectTrueRatingsStats();
 
-    // Listen for changes to the setting
     browser.storage.onChanged.addListener((changes, area) => {
         if (area === 'local' && changes.trueRatingsStats) {
             enabled = !!changes.trueRatingsStats.newValue;
             if (enabled) injectTrueRatingsStats();
-            else {
-                // Remove stats if present
-                document.querySelectorAll('.true-ratings-stats').forEach(e => e.remove());
-            }
+            else document.querySelectorAll('.true-ratings-stats-section').forEach(e => e.remove());
         }
     });
 
-    // Observe DOM changes to re-inject if needed
+    // The histogram is loaded asynchronously, so inject once it appears
     const observer = new MutationObserver(() => {
         if (enabled) injectTrueRatingsStats();
     });
     observer.observe(document.body, { childList: true, subtree: true });
 }
 
-// Add a toggle button to the nav bar for fading unavailable movies
-function addFadeToggleToNav() {
-    const tryInsert = () => {
-        const nav = document.querySelector('ul.navitems');
-        if (!nav) {
-            setTimeout(tryInsert, 500);
-            return;
-        }
-        // Avoid duplicate insertion
-        if (nav.querySelector('.fade-toggle-navitem')) return;
+// --- INIT ---
+let streamFilter: StreamFilter | null = null;
 
-        // Create nav item
-        const li = document.createElement('li');
-        li.className = 'navitem fade-toggle-navitem main-nav-fade';
-        li.style.display = '';
-
-        // Create navlink-style button
-        const btn = document.createElement('a');
-        btn.href = '#';
-        btn.className = 'navlink has-icon';
-        btn.style.display = 'flex';
-        btn.style.alignItems = 'center';
-        btn.style.gap = '4px';
-
-        // Add label
-        const label = document.createElement('span');
-        label.className = 'label';
-        label.style.fontSize = '13px';
-
-        // Set initial state from storage
-        browser.storage.local.get(['fadeUnavailable', 'unavailableOpacity']).then(res => {
-            const fade = res.fadeUnavailable !== false;
-            const opacity = typeof res.unavailableOpacity === 'number' ? res.unavailableOpacity : 0.4;
-            label.textContent = fade ? 'Fading: ON' : 'Fading: OFF';
-            btn.setAttribute('aria-pressed', fade ? 'true' : 'false');
-            setUnavailableOpacityCSS(fade ? opacity : 1);
-        });
-
-        btn.addEventListener('click', (e) => {
-            e.preventDefault();
-            browser.storage.local.get(['fadeUnavailable', 'unavailableOpacity']).then(res => {
-                const fade = res.fadeUnavailable !== false;
-                const newFade = !fade;
-                const opacity = typeof res.unavailableOpacity === 'number' ? res.unavailableOpacity : 0.4;
-                browser.storage.local.set({ fadeUnavailable: newFade }).then(() => {
-                    setUnavailableOpacityCSS(newFade ? opacity : 1);
-                });
-            });
-        });
-
-        btn.appendChild(label);
-        li.appendChild(btn);
-
-        // Insert after Activity nav item
-        const activityNav = nav.querySelector('.main-nav-activity');
-        if (activityNav && activityNav.nextSibling) {
-            nav.insertBefore(li, activityNav.nextSibling);
-        } else if (activityNav) {
-            nav.appendChild(li);
-        } else {
-            nav.appendChild(li);
-        }
-
-        // Update button if fadeUnavailable changes elsewhere (including from options page)
-        browser.storage.onChanged.addListener((changes, area) => {
-            if (area === 'local' && btn.isConnected && (changes.fadeUnavailable || changes.unavailableOpacity)) {
-                browser.storage.local.get(['fadeUnavailable', 'unavailableOpacity']).then(res => {
-                    const fade = res.fadeUnavailable !== false;
-                    const opacity = typeof res.unavailableOpacity === 'number' ? res.unavailableOpacity : 0.4;
-                    label.textContent = fade ? 'Fading: ON' : 'Fading: OFF';
-                    btn.setAttribute('aria-pressed', fade ? 'true' : 'false');
-                    setUnavailableOpacityCSS(fade ? opacity : 1);
-                });
-            }
-        });
-    };
-    tryInsert();
+function startStreamFilter(settings: Partial<ExtensionSettings>): void {
+    if (!settings.tmdbApiKey && !settings.tmdbReadApiKey) {
+        showWarning('<strong>TMDB API key required!</strong> Configure it in the extension settings.');
+        return;
+    }
+    hideWarning();
+    streamFilter = new StreamFilter(
+        settings.tmdbApiKey,
+        settings.tmdbReadApiKey,
+        settings.selectedProviders || DEFAULT_PROVIDERS,
+        settings.countryCode || DEFAULT_COUNTRY
+    );
+    streamFilter.observePage();
 }
+
+browser.storage.onChanged.addListener(async (changes, area) => {
+    if (area !== 'local' || !Object.keys(changes).some(key => SETTINGS_KEYS.includes(key))) return;
+    const settings = await browser.storage.local.get(SETTINGS_KEYS) as Partial<ExtensionSettings>;
+
+    if (changes.fadeUnavailable || changes.unavailableOpacity) {
+        applyFadeSettings(settings);
+    }
+    if (changes.tmdbApiKey || changes.tmdbReadApiKey) {
+        // New credentials: start over with a fresh client
+        streamFilter?.stop();
+        streamFilter = null;
+        startStreamFilter(settings);
+    } else if (streamFilter && (changes.selectedProviders || changes.countryCode)) {
+        streamFilter.updateFilter(
+            settings.selectedProviders || DEFAULT_PROVIDERS,
+            settings.countryCode || DEFAULT_COUNTRY
+        );
+    }
+});
+
+logger.info('[ContentScript] Initializing extension...');
+browser.storage.local.get(SETTINGS_KEYS)
+    .then(result => {
+        const settings = result as Partial<ExtensionSettings>;
+        applyFadeSettings(settings);
+        addFadeToggleToNav(settings);
+        observeRatingsStatsFeature(!!settings.trueRatingsStats);
+        startStreamFilter(settings);
+    })
+    .catch(error => {
+        logger.error(`[ContentScript] Error loading settings: ${error}`);
+    });

@@ -1,4 +1,4 @@
-import { TMDBClient } from './tmdb';
+import { TMDBClient, TMDBError } from './tmdb';
 import { TMDBRegion } from './types';
 import { logger } from './utils/logger';
 
@@ -14,20 +14,23 @@ export async function getCountries(): Promise<TMDBRegion[]> {
     }
 
     const result = await browser.storage.local.get(['tmdbApiKey', 'tmdbReadApiKey']);
-    if (!result.tmdbApiKey || !result.tmdbReadApiKey) {
-        logger.warn(`[Background] TMDB API keys not set. Cannot fetch countries.`);
+    if (!result.tmdbApiKey && !result.tmdbReadApiKey) {
+        logger.warn(`[Background] TMDB API key not set. Cannot fetch countries.`);
         return [];
     }
 
     try {
         const tmdb = new TMDBClient(result.tmdbApiKey, result.tmdbReadApiKey);
-        cachedCountries = await tmdb.getAvailableCountries();
-        cachedAt = Date.now();
-        logger.info(`[Background] Fetched and cached ${cachedCountries.length} countries from TMDB`);
-        return cachedCountries;
+        const countries = await tmdb.getAvailableCountries();
+        if (countries.length) {
+            cachedCountries = countries;
+            cachedAt = Date.now();
+        }
+        logger.info(`[Background] Fetched ${countries.length} countries from TMDB`);
+        return countries;
     } catch (error) {
         logger.error(`[Background] Failed to fetch countries from TMDB: ${error}`);
-        return [];
+        throw error;
     }
 }
 
@@ -39,8 +42,19 @@ browser.runtime.onMessage.addListener(async (request) => {
             return await getCountries();
         } catch (error) {
             logger.error(`[Background] Country fetch failed: ${error}`);
+            if (error instanceof TMDBError && error.status === 401) {
+                return { error: 'TMDB rejected the API key. Check that it is correct.' };
+            }
             return { error: 'Failed to load countries' };
         }
     }
     return undefined;
+});
+
+// Keys changed: the cached list may have been fetched with other credentials
+browser.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && (changes.tmdbApiKey || changes.tmdbReadApiKey)) {
+        cachedCountries = [];
+        cachedAt = 0;
+    }
 });

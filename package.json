@@ -3,6 +3,7 @@
     "version": "1.0.0",
     "scripts": {
         "build": "webpack --mode=development",
+        "typecheck": "tsc --noEmit",
         "build:prod": "webpack --mode=production",
         "watch": "webpack --watch --mode=development",
         "export": "webpack --mode=production && cd dist && zip -r ../letterboxd-utils.zip ./*",
