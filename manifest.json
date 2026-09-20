@@ -1,7 +1,7 @@
 {
     "manifest_version": 2,
     "name": "Letterboxd utils",
-    "version": "1.4.0",
+    "version": "1.5.0",
     "description": "Utilities for letterboxd.com: fade movies not on your streaming services and show detailed rating stats.",
     "icons": {
         "383": "icon.png"
